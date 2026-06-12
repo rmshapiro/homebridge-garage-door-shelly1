@@ -1,4 +1,5 @@
 var Service, Characteristic;
+
 const packageJson = require("./package.json");
 const request = require("request");
 const jp = require("jsonpath");
@@ -6,11 +7,19 @@ const jp = require("jsonpath");
 module.exports = function (homebridge) {
     Service = homebridge.hap.Service;
     Characteristic = homebridge.hap.Characteristic;
+
     homebridge.registerAccessory(
         "homebridge-garage-door-shelly1",
         "GarageDoorOpener",
         GarageDoorOpener
     );
+};
+
+const STATES = {
+    OPEN: 0,
+    CLOSED: 1,
+    OPENING: 2,
+    CLOSING: 3
 };
 
 function GarageDoorOpener(log, config) {
@@ -45,289 +54,267 @@ function GarageDoorOpener(log, config) {
     this.polling = config.polling || false;
     this.pollInterval = config.pollInterval || 120;
     this.movementPollInterval = config.movementPollInterval || 2;
-    this.isMoving = false;
 
     this.statusURL = config.statusURL;
     this.statusKey = config.statusKey || "$.inputs[0].input";
 
     this.statusValueOpen = config.statusValueOpen || "0";
     this.statusValueClosed = config.statusValueClosed || "1";
-    this.statusValueOpening = config.statusValueOpening || "2";
-    this.statusValueClosing = config.statusValueClosing || "3";
 
-    if (this.username != null && this.password != null) {
+    this.auth = null;
+    if (this.username && this.password) {
         this.auth = {
             user: this.username,
             pass: this.password,
         };
     }
 
+    // STATE MACHINE
+    this.state = "UNKNOWN";
+    this.movementToken = 0;
+    this.pollTimer = null;
+    this.timeoutTimer = null;
+
     this.service = new Service.GarageDoorOpener(this.name);
 }
 
-GarageDoorOpener.prototype = {
-    identify: function (callback) {
-        this.log("Identify requested!");
-        callback();
-    },
-
-    _httpRequest: function (url, body, method, callback) {
-        request({
-            url: url,
-            body: body,
+/* -------------------------
+   HTTP
+--------------------------*/
+GarageDoorOpener.prototype._httpRequest = function (url, body, method, callback) {
+    request(
+        {
+            url,
+            body,
             method: this.http_method,
             timeout: this.timeout,
             rejectUnauthorized: false,
             auth: this.auth,
         },
-            function (error, response, body) {
-                callback(error, response, body);
-            }
-        );
-    },
+        (error, response, body) => callback(error, response, body)
+    );
+};
 
-    _fetchStatus: function (callback) {
-        var url = this.statusURL;
+/* -------------------------
+   SENSOR STATUS
+--------------------------*/
+GarageDoorOpener.prototype._fetchStatus = function (callback) {
+    this._httpRequest(this.statusURL, "", "GET", (error, response, body) => {
+        if (error) return callback(error);
 
-        if (this.config.debug) {
-            this.log.debug("Getting status: %s", url);
+        try {
+            const json = typeof body === "string" ? JSON.parse(body) : body;
+
+            const raw = jp.query(json, this.statusKey).pop();
+
+            let value = -1;
+
+            if (new RegExp(this.statusValueOpen).test(raw)) value = 0;
+            else if (new RegExp(this.statusValueClosed).test(raw)) value = 1;
+
+            callback(null, value);
+        } catch (e) {
+            callback(e);
         }
+    });
+};
 
-        this._httpRequest(
-            url,
-            "",
-            "GET",
-            function (error, response, responseBody) {
-                if (error) {
-                    callback(error);
-                } else {
-                    let statusValue = 0;
+/* -------------------------
+   STATE MACHINE CORE
+--------------------------*/
+GarageDoorOpener.prototype._setState = function (state, source = "internal") {
+    this.state = state;
 
-                    if (this.statusKey) {
-                        var originalStatusValue = jp
-                            .query(
-                                typeof responseBody === "string" ?
-                                    JSON.parse(responseBody) :
-                                    responseBody,
-                                this.statusKey,
-                                1
-                            )
-                            .pop();
+    let hk;
 
-                        if (new RegExp(this.statusValueOpen).test(originalStatusValue)) {
-                            statusValue = 0;
-                        } else if (
-                            new RegExp(this.statusValueClosed).test(originalStatusValue)
-                        ) {
-                            statusValue = 1;
-                        } else if (
-                            new RegExp(this.statusValueOpening).test(originalStatusValue)
-                        ) {
-                            statusValue = 2;
-                        } else if (
-                            new RegExp(this.statusValueClosing).test(originalStatusValue)
-                        ) {
-                            statusValue = 3;
-                        }
+    switch (state) {
+        case "OPEN":
+            hk = Characteristic.CurrentDoorState.OPEN;
+            break;
+        case "CLOSED":
+            hk = Characteristic.CurrentDoorState.CLOSED;
+            break;
+        case "OPENING":
+            hk = Characteristic.CurrentDoorState.OPENING;
+            break;
+        case "CLOSING":
+            hk = Characteristic.CurrentDoorState.CLOSING;
+            break;
+        default:
+            return;
+    }
 
-                        if (this.config.debug) {
-                            this.log.debug(
-                                "Transformed status value from %s to %s (%s)",
-                                originalStatusValue,
-                                statusValue,
-                                this.statusKey
-                            );
-                        }
-                    } else {
-                        statusValue = responseBody;
-                    }
-                    callback(null, statusValue);
-                }
-            }.bind(this)
-        );
-    },
+    this.service.updateCharacteristic(
+        Characteristic.CurrentDoorState,
+        hk
+    );
 
-    _getStatus: function (callback) {
-        this._fetchStatus(function (error, statusValue) {
-            if (error) {
-                this.log.error("Error getting status: %s", error.message);
-                this.service
-                    .getCharacteristic(Characteristic.CurrentDoorState)
-                    .updateValue(new Error("Polling failed"));
-                callback(error);
-            } else {
-                this.service
-                    .getCharacteristic(Characteristic.CurrentDoorState)
-                    .updateValue(statusValue);
-                this.service
-                    .getCharacteristic(Characteristic.TargetDoorState)
-                    .updateValue(statusValue);
-
-                if (this.config.debug) {
-                    this.log.debug("Updated door state to: %s", statusValue);
-                }
-
-                callback();
-            }
-        }.bind(this));
-    },
-
-    setTargetDoorState: function (value, callback) {
-        var url;
-
-        this.log.debug("Setting targetDoorState to %s", value);
-
-        if (value === 1) {
-            url = this.closeURL;
-        } else {
-            url = this.openURL;
-        }
-
-        this._httpRequest(
-            url,
-            "",
-            this.http_method,
-            function (error, response, responseBody) {
-                if (error) {
-                    this.log.warn("Error setting targetDoorState: %s", error.message);
-                    callback(error);
-                } else {
-                    if (value === 1) {
-                        this.log("Started closing");
-                        this.simulateClose();
-                    } else {
-                        this.log("Started opening");
-                        if (this.switchOff) {
-                            this.switchOffFunction();
-                        }
-                        if (this.autoLock) {
-                            this.autoLockFunction();
-                        }
-                        this.simulateOpen();
-                    }
-                    callback();
-                }
-            }.bind(this)
-        );
-    },
-
-    simulateOpen: function () {
-        this.isMoving = true;
-        this.service
-            .getCharacteristic(Characteristic.CurrentDoorState)
-            .updateValue(2);
-
-        const pollingTimer = setInterval(() => {
-            this._fetchStatus((err, value) => {
-                if (!err && value === 0) { // Open
-                    this.log("Detected Open state early");
-                    clearInterval(pollingTimer);
-                    clearTimeout(timeoutTimer);
-                    this.service
-                        .getCharacteristic(Characteristic.CurrentDoorState)
-                        .updateValue(0);
-                    this.isMoving = false;
-                    this.log("Finished opening");
-                }
-            });
-        }, this.movementPollInterval * 1000);
-
-        const timeoutTimer = setTimeout(() => {
-            clearInterval(pollingTimer);
-            this.log("Opening time concluded, updating status");
-            this._getStatus(() => {
-                this.isMoving = false;
-                this.log("Finished opening (timeout)");
-            });
-        }, this.openTime * 1000);
-    },
-
-    simulateClose: function () {
-        this.isMoving = true;
-        this.service
-            .getCharacteristic(Characteristic.CurrentDoorState)
-            .updateValue(3);
-
-        const pollingTimer = setInterval(() => {
-            this._fetchStatus((err, value) => {
-                if (!err && value === 1) { // Closed
-                    this.log("Detected Closed state early");
-                    clearInterval(pollingTimer);
-                    clearTimeout(timeoutTimer);
-                    this.service
-                        .getCharacteristic(Characteristic.CurrentDoorState)
-                        .updateValue(1);
-                    this.isMoving = false;
-                    this.log("Finished closing");
-                }
-            });
-        }, this.movementPollInterval * 1000);
-
-        const timeoutTimer = setTimeout(() => {
-            clearInterval(pollingTimer);
-            this.log("Closing time concluded, updating status");
-            this._getStatus(() => {
-                this.isMoving = false;
-                this.log("Finished closing (timeout)");
-            });
-        }, this.closeTime * 1000);
-    },
-
-    autoLockFunction: function () {
-        this.log("Waiting %s seconds for autolock", this.autoLockDelay);
-        setTimeout(() => {
-            this.service.setCharacteristic(Characteristic.TargetDoorState, 1);
-            this.log("Autolocking...");
-        }, this.autoLockDelay * 1000);
-    },
-
-    switchOffFunction: function () {
-        this.log("Waiting %s seconds for switch off", this.switchOffDelay);
-        setTimeout(() => {
-            this.log("SwitchOff...");
-            this._httpRequest(
-                this.closeURL,
-                "",
-                this.http_method,
-                function (error, response, responseBody) { }.bind(this)
+    // sync Target when sensor confirms final state
+    if (source === "sensor" || source === "sensor-final") {
+        if (state === "OPEN") {
+            this.service.updateCharacteristic(
+                Characteristic.TargetDoorState,
+                Characteristic.TargetDoorState.OPEN
             );
-        }, this.switchOffDelay * 1000);
-    },
-
-    getServices: function () {
-        this.informationService = new Service.AccessoryInformation();
-
-        this.informationService
-            .setCharacteristic(Characteristic.Manufacturer, this.manufacturer)
-            .setCharacteristic(Characteristic.Model, this.model)
-            .setCharacteristic(Characteristic.SerialNumber, this.serial)
-            .setCharacteristic(Characteristic.FirmwareRevision, this.firmware);
-
-        this.service
-            .getCharacteristic(Characteristic.TargetDoorState)
-            .on("set", this.setTargetDoorState.bind(this));
-
-        if (this.polling) {
-            this._getStatus(function () { });
-
-            setInterval(
-                function () {
-                    if (!this.isMoving) {
-                        this._getStatus(function () { });
-                    }
-                }.bind(this),
-                this.pollInterval * 1000
-            );
-        } else {
-            this.service
-                .getCharacteristic(Characteristic.CurrentDoorState)
-                .updateValue(1);
-
-            this.service
-                .getCharacteristic(Characteristic.TargetDoorState)
-                .updateValue(1);
         }
 
-        return [this.informationService, this.service];
-    },
+        if (state === "CLOSED") {
+            this.service.updateCharacteristic(
+                Characteristic.TargetDoorState,
+                Characteristic.TargetDoorState.CLOSED
+            );
+        }
+
+        // also clear movement state
+        this.movementToken++;
+    }
+
+    if (this.config.debug) {
+        this.log.debug(`STATE => ${state} (${source})`);
+    }
+};
+
+/* -------------------------
+   SENSOR SYNC (IDLE ONLY)
+--------------------------*/
+GarageDoorOpener.prototype._syncFromSensor = function () {
+    if (this.state === "OPENING" || this.state === "CLOSING") return;
+
+    this._fetchStatus((err, value) => {
+        if (err) return;
+
+        if (value === 0) this._setState("OPEN", "sensor");
+        if (value === 1) this._setState("CLOSED", "sensor");
+    });
+};
+
+/* -------------------------
+   COMMAND HANDLER
+--------------------------*/
+GarageDoorOpener.prototype.setTargetDoorState = function (value, callback) {
+    const desired = value === 0 ? "OPEN" : "CLOSED";
+
+    // nothing to do if door is already at correct state
+    if (
+        (desired === "OPEN" && this.state === "OPEN") ||
+        (desired === "CLOSED" && this.state === "CLOSED")
+    ) {
+	this.log.debug("%s requested but current state is %s",desired, this.state);
+        return callback();
+    }
+
+    this.movementToken++;
+    const token = this.movementToken;
+
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+
+    this._setState(desired === "OPEN" ? "OPENING" : "CLOSING", "command");
+
+    const url = value === 1 ? this.closeURL : this.openURL;
+
+    this._httpRequest(url, "", this.http_method, (error) => {
+        if (error) {
+            this.log.warn("Command error: %s", error.message);
+            return callback(error);
+        }
+
+        this.service.updateCharacteristic(
+            Characteristic.TargetDoorState,
+            value
+        );
+
+        this.log.debug("Setting targetDoorState to %s", desired);
+        this._startMovementMonitor(desired, token);
+
+        callback();
+    });
+};
+
+/* -------------------------
+   MOVEMENT MONITOR
+--------------------------*/
+GarageDoorOpener.prototype._startMovementMonitor = function (desired, token) {
+    const targetState = desired;
+
+    this.pollTimer = setInterval(() => {
+        if (token !== this.movementToken) return;
+
+        this._fetchStatus((err, value) => {
+            if (err) return;
+
+            const reached =
+                (targetState === "OPEN" && value === 0) ||
+                (targetState === "CLOSED" && value === 1);
+
+            if (reached) {
+                clearInterval(this.pollTimer);
+                clearTimeout(this.timeoutTimer);
+
+            this._setState(targetState, "sensor-final");
+
+            this.service.updateCharacteristic(
+               Characteristic.TargetDoorState,
+               targetState === "OPEN"
+                  ? Characteristic.TargetDoorState.OPEN
+                  : Characteristic.TargetDoorState.CLOSED
+            );
+         }
+        });
+    }, this.movementPollInterval * 1000);
+
+    this.timeoutTimer = setTimeout(() => {
+        if (token !== this.movementToken) return;
+
+        clearInterval(this.pollTimer);
+
+        this.log.warn("Movement timeout → resyncing sensor");
+
+        this._syncFromSensor();
+    }, (desired === "OPEN" ? this.openTime : this.closeTime) * 1000);
+};
+
+/* -------------------------
+   IDENTIFY
+--------------------------*/
+GarageDoorOpener.prototype.identify = function (callback) {
+    this.log("Identify requested");
+    callback();
+};
+
+/* -------------------------
+   SERVICES
+--------------------------*/
+GarageDoorOpener.prototype.getServices = function () {
+    this.informationService = new Service.AccessoryInformation();
+
+    this.informationService
+        .setCharacteristic(Characteristic.Manufacturer, this.manufacturer)
+        .setCharacteristic(Characteristic.Model, this.model)
+        .setCharacteristic(Characteristic.SerialNumber, this.serial)
+        .setCharacteristic(Characteristic.FirmwareRevision, this.firmware);
+
+    this.service
+        .getCharacteristic(Characteristic.TargetDoorState)
+        .on("set", this.setTargetDoorState.bind(this));
+
+    if (this.polling) {
+        this._syncFromSensor();
+
+        setInterval(() => {
+            this._syncFromSensor();
+        }, this.pollInterval * 1000);
+    } else {
+        this.service.updateCharacteristic(
+            Characteristic.CurrentDoorState,
+            STATES.CLOSED
+        );
+
+        this.service.updateCharacteristic(
+            Characteristic.TargetDoorState,
+            STATES.CLOSED
+        );
+    }
+
+    return [this.informationService, this.service];
 };
